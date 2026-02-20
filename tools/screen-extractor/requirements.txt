@@ -1,0 +1,13 @@
+# Core
+Pillow>=10.0.0
+numpy>=1.24.0
+pytesseract>=0.3.10
+pynput>=1.7.6
+
+# Image comparison (optional but recommended)
+scikit-image>=0.21.0
+
+# Table detection (optional)
+opencv-python>=4.8.0
+img2table>=1.2.0
+tabulate>=0.9.0
