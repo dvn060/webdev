@@ -226,9 +226,32 @@ def _extract_table_fallback(pil_img):
     if pytesseract is None:
         return "Error: pytesseract not installed."
     try:
-        return pytesseract.image_to_string(pil_img, config="--psm 6")
+        processed = _preprocess_for_ocr(pil_img)
+        return pytesseract.image_to_string(processed, config="--psm 6")
     except Exception as exc:
         return f"Table OCR fallback error: {exc}"
+
+
+def _preprocess_for_ocr(pil_img):
+    """Preprocess a PIL image to improve Tesseract OCR accuracy."""
+    from PIL import ImageFilter
+
+    img = pil_img.convert("L")  # grayscale
+
+    # Upscale small images so Tesseract can read the glyphs
+    w, h = img.size
+    if w < 1000:
+        scale = max(2, 1500 // w)
+        img = img.resize((w * scale, h * scale), Image.LANCZOS)
+
+    # Sharpen to recover edges lost during scaling
+    img = img.filter(ImageFilter.SHARPEN)
+
+    # Binarize with Otsu-style threshold (simple but effective)
+    arr = np.array(img)
+    threshold = int(np.mean(arr))
+    arr = ((arr > threshold) * 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
 
 def _ocr_image(pil_img):
@@ -236,7 +259,8 @@ def _ocr_image(pil_img):
     if pytesseract is None:
         return "Error: pytesseract is not installed."
     try:
-        return pytesseract.image_to_string(pil_img)
+        processed = _preprocess_for_ocr(pil_img)
+        return pytesseract.image_to_string(processed, config="--psm 6")
     except Exception as exc:
         return f"OCR error: {exc}"
 
