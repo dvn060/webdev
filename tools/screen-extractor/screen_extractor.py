@@ -295,6 +295,15 @@ class ScreenExtractorApp:
         self._temp_dir = tempfile.mkdtemp(prefix="screen_extractor_")
         self._csv_tables = []
 
+        # Auto-advance state
+        self._auto_advancing = False
+        self._auto_advance_thread = None
+        self._advance_key_var = tk.StringVar(value="Right Arrow")
+        self._advance_delay = tk.DoubleVar(value=1.5)
+        self._page_limit = tk.IntVar(value=0)
+        self._auto_save_path = tk.StringVar(value="")
+        self._realtime_output_parts = []
+
         self._build_gui()
         self._start_hotkey_listener()
 
@@ -338,6 +347,58 @@ class ScreenExtractorApp:
         self.btn_stop = ttk.Button(frm_auto, text="Stop & Process", command=self._stop_and_process, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, **pad)
 
+        # ---- PDF Auto-Advance ----
+        frm_advance = ttk.LabelFrame(self.root, text="PDF Auto-Advance", padding=6)
+        frm_advance.pack(fill=tk.X, **pad)
+
+        adv_row1 = ttk.Frame(frm_advance)
+        adv_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(adv_row1, text="Advance key:").pack(side=tk.LEFT, **pad)
+        self.cmb_key = ttk.Combobox(
+            adv_row1, textvariable=self._advance_key_var, width=14,
+            state="readonly",
+            values=["Right Arrow", "Page Down", "Space", "Down Arrow"],
+        )
+        self.cmb_key.pack(side=tk.LEFT, **pad)
+        ttk.Label(adv_row1, text="Delay (s):").pack(side=tk.LEFT, **pad)
+        self.spn_delay = ttk.Spinbox(
+            adv_row1, textvariable=self._advance_delay,
+            from_=0.5, to=10.0, increment=0.5, width=5,
+        )
+        self.spn_delay.pack(side=tk.LEFT, **pad)
+        ttk.Label(adv_row1, text="Max pages (0=all):").pack(side=tk.LEFT, **pad)
+        self.spn_limit = ttk.Spinbox(
+            adv_row1, textvariable=self._page_limit,
+            from_=0, to=9999, increment=1, width=5,
+        )
+        self.spn_limit.pack(side=tk.LEFT, **pad)
+
+        adv_row2 = ttk.Frame(frm_advance)
+        adv_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(adv_row2, text="Auto-save file:").pack(side=tk.LEFT, **pad)
+        self.ent_save = ttk.Entry(
+            adv_row2, textvariable=self._auto_save_path, width=35,
+        )
+        self.ent_save.pack(side=tk.LEFT, **pad)
+        ttk.Button(
+            adv_row2, text="Browse", command=self._choose_auto_save_path,
+        ).pack(side=tk.LEFT, **pad)
+
+        adv_row3 = ttk.Frame(frm_advance)
+        adv_row3.pack(fill=tk.X, pady=2)
+        self.btn_auto_adv = ttk.Button(
+            adv_row3, text="Start Auto-Advance (F7)",
+            command=self._start_auto_advance,
+        )
+        self.btn_auto_adv.pack(side=tk.LEFT, **pad)
+        self.btn_stop_adv = ttk.Button(
+            adv_row3, text="Stop Auto-Advance",
+            command=self._stop_auto_advance, state=tk.DISABLED,
+        )
+        self.btn_stop_adv.pack(side=tk.LEFT, **pad)
+        self.lbl_adv_status = ttk.Label(adv_row3, text="", foreground="blue")
+        self.lbl_adv_status.pack(side=tk.LEFT, **pad)
+
         # Page counter and status
         frm_status = ttk.Frame(self.root)
         frm_status.pack(fill=tk.X, **pad)
@@ -374,7 +435,7 @@ class ScreenExtractorApp:
         # Hotkey reminder
         ttk.Label(
             self.root,
-            text="Hotkeys: F9=Capture | F8=Capture Table | F10=Stop & Process",
+            text="Hotkeys: F7=Auto-Advance | F9=Capture | F8=Table | F10=Stop & Process",
             foreground="gray",
         ).pack(**pad)
 
@@ -517,6 +578,258 @@ class ScreenExtractorApp:
         self.btn_stop.config(state=tk.DISABLED)
         self._set_status("Stopped")
 
+    # ---------------------------------------------------- auto-advance (PDF mode)
+
+    def _choose_auto_save_path(self):
+        """Browse for auto-save file location."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Choose auto-save output file",
+        )
+        if path:
+            self._auto_save_path.set(path)
+
+    def _start_auto_advance(self):
+        """Start the auto-advance PDF capture loop."""
+        if not self.region:
+            messagebox.showwarning("No region", "Please select a capture region first.")
+            return
+        if self._auto_advancing:
+            return
+        if pynput_keyboard is None:
+            messagebox.showerror(
+                "Missing pynput",
+                "pynput is required for auto-advance.\nInstall with: pip install pynput",
+            )
+            return
+
+        # Default auto-save path if none chosen
+        if not self._auto_save_path.get():
+            default_path = os.path.join(self._temp_dir, "auto_capture_output.txt")
+            self._auto_save_path.set(default_path)
+
+        self._auto_advancing = True
+        self._realtime_output_parts = []
+        self.btn_auto_adv.config(state=tk.DISABLED)
+        self.btn_stop_adv.config(state=tk.NORMAL)
+        self.btn_start.config(state=tk.DISABLED)
+        self._set_status("Auto-advancing...")
+        self.root.after(0, self.lbl_adv_status.config, {"text": "Starting..."})
+
+        self._auto_save_write_header()
+
+        self._auto_advance_thread = threading.Thread(
+            target=self._auto_advance_loop, daemon=True,
+        )
+        self._auto_advance_thread.start()
+
+    def _stop_auto_advance(self):
+        """Stop the auto-advance loop."""
+        self._auto_advancing = False
+        self.btn_auto_adv.config(state=tk.NORMAL)
+        self.btn_stop_adv.config(state=tk.DISABLED)
+        self.btn_start.config(state=tk.NORMAL)
+        self.lbl_adv_status.config(text="Stopped")
+        self._set_status("Auto-advance stopped")
+
+    def _auto_advance_finished(self, reason):
+        """Called on the main thread when auto-advance completes."""
+        self._auto_advancing = False
+        self.btn_auto_adv.config(state=tk.NORMAL)
+        self.btn_stop_adv.config(state=tk.DISABLED)
+        self.btn_start.config(state=tk.NORMAL)
+        self.lbl_adv_status.config(text=reason)
+        save_path = self._auto_save_path.get()
+        self._set_status(f"Done: {reason}. Saved to {save_path}")
+        threading.Thread(target=_play_beep, daemon=True).start()
+
+    def _simulate_advance_key(self):
+        """Simulate pressing the selected advance key to move the PDF forward."""
+        if pynput_keyboard is None:
+            return
+        key_map = {
+            "Right Arrow": pynput_keyboard.Key.right,
+            "Page Down": pynput_keyboard.Key.page_down,
+            "Space": pynput_keyboard.Key.space,
+            "Down Arrow": pynput_keyboard.Key.down,
+        }
+        key_name = self._advance_key_var.get()
+        key = key_map.get(key_name, pynput_keyboard.Key.right)
+        try:
+            controller = pynput_keyboard.Controller()
+            controller.press(key)
+            controller.release(key)
+        except Exception as exc:
+            self.root.after(0, self._set_status, f"Key sim error: {exc}")
+
+    def _auto_advance_loop(self):
+        """Background thread: capture current page -> OCR -> advance -> repeat."""
+        consecutive_duplicates = 0
+        max_duplicates = 3  # stop after this many identical frames in a row
+
+        while self._auto_advancing:
+            # 1. Grab and wait for the screen to be stable
+            img = self._grab_region()
+            if img is None:
+                time.sleep(0.5)
+                continue
+
+            time.sleep(0.5)
+            stable = self._grab_region()
+            if stable is None:
+                time.sleep(0.5)
+                continue
+
+            settle_diff = _compute_difference(img, stable)
+            if settle_diff > 2.0:
+                # Still rendering – give it more time
+                time.sleep(0.8)
+                stable = self._grab_region()
+                if stable is None:
+                    continue
+
+            # 2. Duplicate check – have we already captured this exact page?
+            if self._last_captured_image is not None:
+                dup_diff = _compute_difference(self._last_captured_image, stable)
+                if dup_diff < self.DUPLICATE_THRESHOLD:
+                    consecutive_duplicates += 1
+                    if consecutive_duplicates >= max_duplicates:
+                        self.root.after(
+                            0, self._auto_advance_finished,
+                            f"End of document (page {self.page_counter})",
+                        )
+                        return
+                    # Try advancing again – maybe the keypress didn't register
+                    self._simulate_advance_key()
+                    time.sleep(self._advance_delay.get())
+                    continue
+
+            consecutive_duplicates = 0
+
+            # 3. Capture this page
+            self._do_capture(stable, is_table=False)
+
+            # 4. Real-time OCR + append to output & auto-save file
+            if self.captures:
+                last_caps = self.captures[-1:]
+                if self.dual_page.get() and len(self.captures) >= 2:
+                    last_caps = self.captures[-2:]
+                for cap in last_caps:
+                    if not cap.get("processed"):
+                        self._process_page_realtime(cap)
+
+            # 5. Update status labels
+            self.root.after(
+                0, self._set_status,
+                f"Auto-advancing... page {self.page_counter}",
+            )
+            self.root.after(
+                0, self.lbl_adv_status.config,
+                {"text": f"Page {self.page_counter}"},
+            )
+
+            # 6. Check page limit
+            limit = self._page_limit.get()
+            if limit > 0 and self.page_counter >= limit:
+                self.root.after(
+                    0, self._auto_advance_finished,
+                    f"Page limit reached ({limit})",
+                )
+                return
+
+            if not self._auto_advancing:
+                break
+
+            # 7. Press the advance key
+            self._simulate_advance_key()
+
+            # 8. Wait for the page to visibly change
+            time.sleep(0.3)
+            change_timeout = 5.0
+            t0 = time.time()
+            while self._auto_advancing and (time.time() - t0) < change_timeout:
+                new_frame = self._grab_region()
+                if new_frame is not None:
+                    diff = _compute_difference(stable, new_frame)
+                    if diff > self.sensitivity.get():
+                        break
+                time.sleep(0.2)
+
+            # 9. Let the new page finish rendering
+            time.sleep(self._advance_delay.get())
+
+        self.root.after(0, self._auto_advance_finished, "Stopped by user")
+
+    # ---- real-time OCR & auto-save helpers ----
+
+    def _process_page_realtime(self, cap):
+        """OCR a single captured page and append to the output widget + file."""
+        img = cap["image"]
+        pnum = cap["page_num"]
+        is_table = cap["is_table"]
+
+        separator = f"\n{'=' * 50}\n  PAGE {pnum}\n{'=' * 50}\n"
+
+        if is_table:
+            md, csv_text = _extract_table_img2table(img)
+            if md:
+                page_text = f"{separator}\n[TABLE]\n{md}\n"
+                if csv_text:
+                    self._csv_tables.append({"page": pnum, "csv": csv_text})
+            else:
+                fallback = _extract_table_fallback(img)
+                page_text = f"{separator}\n[TABLE]\n{fallback}\n"
+                self._csv_tables.append({"page": pnum, "csv": fallback})
+        else:
+            text = _ocr_image(img)
+            page_text = f"{separator}\n{text}\n"
+
+        cap["text"] = page_text
+        cap["processed"] = True
+        self._realtime_output_parts.append(page_text)
+
+        # Append to text widget (main thread)
+        self.root.after(0, self._append_to_output, page_text)
+        # Append to auto-save file
+        self._auto_save_append(page_text)
+
+    def _append_to_output(self, text):
+        """Append text to the output widget and scroll to the bottom."""
+        self.txt_output.insert(tk.END, text)
+        self.txt_output.see(tk.END)
+
+    def _auto_save_write_header(self):
+        """Write a descriptive header to the auto-save file."""
+        path = self._auto_save_path.get()
+        if not path:
+            return
+        try:
+            from datetime import datetime
+            header = (
+                f"# Screen Extractor - PDF Auto-Advance Capture\n"
+                f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# Region: {self.region}\n"
+                f"#\n"
+                f"# Each page is delimited by ===== PAGE N ===== markers.\n"
+                f"# Feed this file to an LLM to generate a subject index.\n\n"
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header)
+        except Exception:
+            pass
+
+    def _auto_save_append(self, text):
+        """Append a chunk of text to the auto-save file."""
+        path = self._auto_save_path.get()
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+
     # ---------------------------------------------------- capture logic
 
     def _do_capture(self, img, is_table):
@@ -551,6 +864,8 @@ class ScreenExtractorApp:
                 "is_table": detected_table,
                 "page_num": page_num,
                 "ss_path": ss_path,
+                "processed": False,
+                "text": None,
             })
 
         self._last_captured_image = img.copy()
@@ -588,6 +903,8 @@ class ScreenExtractorApp:
 
     def _stop_and_process(self):
         self._stop_monitoring()
+        if self._auto_advancing:
+            self._stop_auto_advance()
         if not self.captures:
             messagebox.showinfo("Nothing", "No pages have been captured yet.")
             return
@@ -603,23 +920,28 @@ class ScreenExtractorApp:
             img = cap["image"]
             is_table = cap["is_table"]
 
+            separator = f"\n{'=' * 50}\n  PAGE {pnum}\n{'=' * 50}\n"
+
+            # Reuse already-processed text from real-time OCR
+            if cap.get("processed") and cap.get("text"):
+                output_parts.append(cap["text"])
+                continue
+
             if is_table:
-                marker = f"--- Page {pnum} (TABLE) ---"
                 md, csv_text = _extract_table_img2table(img)
                 if md:
-                    output_parts.append(f"{marker}\n{md}")
+                    output_parts.append(f"{separator}\n[TABLE]\n{md}\n")
                     if csv_text:
                         self._csv_tables.append({"page": pnum, "csv": csv_text})
                 else:
                     fallback = _extract_table_fallback(img)
-                    output_parts.append(f"{marker}\n{fallback}")
+                    output_parts.append(f"{separator}\n[TABLE]\n{fallback}\n")
                     self._csv_tables.append({"page": pnum, "csv": fallback})
             else:
-                marker = f"--- Page {pnum} ---"
                 text = _ocr_image(img)
-                output_parts.append(f"{marker}\n{text}")
+                output_parts.append(f"{separator}\n{text}\n")
 
-        combined = "\n\n".join(output_parts)
+        combined = "\n".join(output_parts)
         self.root.after(0, self._show_output, combined)
 
     def _show_output(self, text):
@@ -667,13 +989,17 @@ class ScreenExtractorApp:
 
     def _clear_all(self):
         self._stop_monitoring()
+        if self._auto_advancing:
+            self._stop_auto_advance()
         self.captures.clear()
         self._csv_tables.clear()
+        self._realtime_output_parts.clear()
         self.page_counter = 0
         self._last_frame = None
         self._last_captured_image = None
         self.txt_output.delete("1.0", tk.END)
         self._update_page_label()
+        self.lbl_adv_status.config(text="")
         self._set_status("Cleared - ready for new session")
 
     # ---------------------------------------------------- global hotkeys
@@ -684,7 +1010,12 @@ class ScreenExtractorApp:
 
         def _on_press(key):
             try:
-                if key == pynput_keyboard.Key.f9:
+                if key == pynput_keyboard.Key.f7:
+                    if self._auto_advancing:
+                        self.root.after(0, self._stop_auto_advance)
+                    else:
+                        self.root.after(0, self._start_auto_advance)
+                elif key == pynput_keyboard.Key.f9:
                     self.root.after(0, self._manual_capture)
                 elif key == pynput_keyboard.Key.f8:
                     self.root.after(0, self._manual_capture_table)
@@ -701,6 +1032,7 @@ class ScreenExtractorApp:
 
     def _on_close(self):
         self._monitoring = False
+        self._auto_advancing = False
         if self._hotkey_listener:
             try:
                 self._hotkey_listener.stop()
